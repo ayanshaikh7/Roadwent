@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
-import 'jspdf-autotable';
+import autoTable from 'jspdf-autotable';
 import ProfessionalReportView from '../Components/ProfessionalReportView';
 import { getAllReports, deleteReport as deleteReportApi } from '../services/reportService';
 
@@ -212,40 +212,140 @@ const ReportPage = () => {
     return units[unit] || unit;
   };
 
+  // Determine quantity computation type from the item's unit (mirrors EstimatorPage)
+  const getQuantityUnitInfo = (unit) => {
+    const u = (unit || '').toString().trim().toLowerCase();
+    if (['cubic', 'cum'].some(kw => u.includes(kw))) return { type: 'dimensional', dims: 3 };
+    if (['square', 'sqm', 'acre'].some(kw => u.includes(kw))) return { type: 'dimensional', dims: 2 };
+    if (['kilometre', 'kilometer', 'running', 'metre', 'meter', 'span'].some(kw => u.includes(kw))) {
+      if (!u.includes('square') && !u.includes('cubic')) return { type: 'dimensional', dims: 1 };
+    }
+    return { type: 'single' };
+  };
+
+  // Build normalized line items {description, quantity, unit, rate, amount} from a saved report.
+  // Items are raw SSR rows; quantities live in inputData and rates in editableRates.
+  const getReportRows = (report) => {
+    const items = report.items || report.searchResults || [];
+    const inputData = report.inputData || {};
+    const editableRates = report.editableRates || {};
+
+    return items.map((it, idx) => {
+      const itemKey = String(it['SSR Item No.'] ?? it.itemKey ?? idx).trim();
+      const unit = it.unit || it['Unit'] || '';
+      const unitInfo = getQuantityUnitInfo(unit);
+      const rate = parseFloat(
+        editableRates[itemKey] ?? it['Completed Rate for 2022-23 excluding GST In Rs.'] ?? it.rate ?? 0
+      ) || 0;
+      const rows = inputData[itemKey] || [];
+      const quantity = rows.reduce((acc, row) => {
+        const nos = parseFloat(row.nos) || 1;
+        if (unitInfo.type === 'dimensional') {
+          const length = parseFloat(row.length) || 0;
+          const breadth = parseFloat(row.breadth) || 0;
+          const depth = parseFloat(row.depth) || 0;
+          if (unitInfo.dims === 3) return acc + (nos * length * breadth * depth);
+          if (unitInfo.dims === 2) return acc + (nos * length * breadth);
+          return acc + (nos * length);
+        }
+        // Fall back to a directly-stored quantity when there are no input rows
+        return acc + (nos * (parseFloat(row.quantity) || 0));
+      }, rows.length ? 0 : (parseFloat(it.quantity) || 0));
+
+      return {
+        description: it.description || it['Description of the item'] || 'Item',
+        quantity,
+        unit,
+        rate,
+        amount: quantity * rate,
+      };
+    });
+  };
+
+  // Format a date-ish value for display; falls back to the raw value if unparseable
+  const formatDate = (value) => {
+    if (!value) return '';
+    const dt = new Date(value);
+    return Number.isNaN(dt.getTime()) ? String(value) : dt.toLocaleDateString();
+  };
+
+  // Normalize project/client details to the canonical field names used by the
+  // entry forms (projectManager/startDate/endDate/projectDescription and
+  // companyName/phone/email/address). Legacy key names are accepted as fallbacks,
+  // and duration is derived from start/end dates when available.
+  const getReportMeta = (report) => {
+    const p = report.projectDetails || {};
+    const c = report.clientDetails || {};
+
+    let duration = p.projectDuration || '';
+    if (!duration && p.startDate && p.endDate) {
+      const s = new Date(p.startDate);
+      const e = new Date(p.endDate);
+      if (!Number.isNaN(s.getTime()) && !Number.isNaN(e.getTime()) && e >= s) {
+        const days = Math.round((e - s) / (1000 * 60 * 60 * 24));
+        duration = `${days} day${days === 1 ? '' : 's'}`;
+      }
+    }
+
+    return {
+      projectName: p.projectName || report.projectName || report.title || 'N/A',
+      projectManager: p.projectManager || 'N/A',
+      startDate: formatDate(p.startDate) || 'N/A',
+      endDate: formatDate(p.endDate) || 'N/A',
+      duration: duration || 'N/A',
+      projectDescription: p.projectDescription || 'N/A',
+      clientName: c.clientName || 'N/A',
+      companyName: c.companyName || 'N/A',
+      // accept legacy clientContact/clientEmail as fallbacks
+      phone: c.phone || c.clientContact || 'N/A',
+      email: c.email || c.clientEmail || 'N/A',
+      address: c.address || 'N/A',
+    };
+  };
+
   // Download as Excel
   const downloadExcel = (report) => {
     try {
-      const { projectDetails, clientDetails, items } = report;
-      
+      const meta = getReportMeta(report);
+
       // Create workbook and worksheet
       const wb = XLSX.utils.book_new();
-      
+
       // Project and client details
       const detailsData = [
-        ['Project Name', projectDetails?.projectName || 'N/A'],
-        ['Project Location', projectDetails?.projectLocation || 'N/A'],
-        ['Project Duration', projectDetails?.projectDuration || 'N/A'],
-        ['Client Name', clientDetails?.clientName || 'N/A'],
-        ['Client Contact', clientDetails?.clientContact || 'N/A'],
-        ['Client Email', clientDetails?.clientEmail || 'N/A'],
-        ['Date', new Date(report.createdAt).toLocaleDateString()],
+        ['Project Name', meta.projectName],
+        ['Project Manager', meta.projectManager],
+        ['Start Date', meta.startDate],
+        ['End Date', meta.endDate],
+        ['Duration', meta.duration],
+        ['Project Description', meta.projectDescription],
+        ['Client Name', meta.clientName],
+        ['Company', meta.companyName],
+        ['Phone', meta.phone],
+        ['Email', meta.email],
+        ['Address', meta.address],
+        ['Date', formatDate(report.createdAt)],
         ['', ''],
         ['COST ESTIMATION REPORT', ''],
       ];
       
-      // Items data
+      // Items data (normalized from the estimator's stored shape)
+      const rows = getReportRows(report);
       const itemsHeader = ['Description', 'Quantity', 'Unit', 'Rate', 'Amount'];
-      const itemsData = items.map(item => [
-        item.description,
-        item.quantity,
-        item.unit,
-        item.rate,
-        item.quantity * item.rate
+      const itemsData = rows.map(r => [
+        r.description,
+        Number(r.quantity.toFixed(2)),
+        r.unit,
+        Number(r.rate.toFixed(2)),
+        Number(r.amount.toFixed(2))
       ]);
-      
-      // Calculate total
-      const total = items ? items.reduce((sum, item) => sum + (item.quantity * item.rate), 0) : 0;
-      itemsData.push(['', '', '', 'TOTAL', total]);
+
+      // Calculate total (prefer the value saved by the estimator)
+      const computedTotal = rows.reduce((sum, r) => sum + r.amount, 0);
+      const total = (typeof report.grandTotalCost === 'number' && !Number.isNaN(report.grandTotalCost))
+        ? report.grandTotalCost
+        : computedTotal;
+      itemsData.push(['', '', '', 'TOTAL', Number(total.toFixed(2))]);
       
       // Combine all data
       const allData = [...detailsData, itemsHeader, ...itemsData];
@@ -257,7 +357,8 @@ const ReportPage = () => {
       XLSX.utils.book_append_sheet(wb, ws, 'Cost Estimation');
       
       // Generate Excel file
-      XLSX.writeFile(wb, `${projectDetails?.projectName || 'Cost_Estimation'}.xlsx`);
+      const fileBase = meta.projectName !== 'N/A' ? meta.projectName : 'Cost_Estimation';
+      XLSX.writeFile(wb, `${fileBase}.xlsx`);
       
       closeAllDropdowns();
     } catch (e) {
@@ -265,56 +366,130 @@ const ReportPage = () => {
     }
   };
 
+  // Download as CSV
+  const downloadCSV = (report) => {
+    try {
+      const meta = getReportMeta(report);
+      const rows = getReportRows(report);
+      const computedTotal = rows.reduce((sum, r) => sum + r.amount, 0);
+      const total = (typeof report.grandTotalCost === 'number' && !Number.isNaN(report.grandTotalCost))
+        ? report.grandTotalCost
+        : computedTotal;
+
+      const allData = [
+        ['Project Name', meta.projectName],
+        ['Project Manager', meta.projectManager],
+        ['Start Date', meta.startDate],
+        ['End Date', meta.endDate],
+        ['Duration', meta.duration],
+        ['Project Description', meta.projectDescription],
+        ['Client Name', meta.clientName],
+        ['Company', meta.companyName],
+        ['Phone', meta.phone],
+        ['Email', meta.email],
+        ['Address', meta.address],
+        ['Date', formatDate(report.createdAt)],
+        [],
+        ['COST ESTIMATION REPORT'],
+        ['Description', 'Quantity', 'Unit', 'Rate', 'Amount'],
+        ...rows.map(r => [
+          r.description,
+          r.quantity.toFixed(2),
+          r.unit,
+          r.rate.toFixed(2),
+          r.amount.toFixed(2)
+        ]),
+        ['', '', '', 'TOTAL', total.toFixed(2)],
+      ];
+
+      // Serialize to CSV with proper quoting/escaping
+      const csv = allData
+        .map(row => (row || [])
+          .map(cell => {
+            const value = String(cell ?? '');
+            return /[",\n]/.test(value) ? '"' + value.replace(/"/g, '""') + '"' : value;
+          })
+          .join(','))
+        .join('\r\n');
+
+      // Prepend BOM so Excel reads UTF-8 correctly
+      const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      const fileBase = meta.projectName !== 'N/A' ? meta.projectName : 'Cost_Estimation';
+      link.download = `${fileBase}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(link.href);
+
+      closeAllDropdowns();
+    } catch (e) {
+      console.error('Error generating CSV:', e);
+    }
+  };
+
   // Download as PDF
   const downloadPDF = (report) => {
     try {
-      const { projectDetails, clientDetails, items } = report;
-      
+      const meta = getReportMeta(report);
+
       // Create PDF document
       const doc = new jsPDF();
       const pageWidth = doc.internal.pageSize.width;
-      
+
       // Set font
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(18);
-      
+
       // Title
-      doc.text('COST ESTIMATION REPORT', pageWidth / 2, 20, { align: 'center' });
-      
-      // Project details
+      doc.text('COST ESTIMATION REPORT', pageWidth / 2, 18, { align: 'center' });
+      doc.setFontSize(10);
+      doc.setFont('helvetica', 'normal');
+      doc.text(`Date: ${formatDate(report.createdAt)}`, pageWidth / 2, 25, { align: 'center' });
+
+      const rightX = pageWidth - 95;
+
+      // Project details (left column)
       doc.setFontSize(12);
-      doc.text('Project Details:', 14, 35);
-      doc.setFont('helvetica', 'normal');
-      doc.text(`Project Name: ${projectDetails?.projectName || 'N/A'}`, 14, 42);
-      doc.text(`Location: ${projectDetails?.projectLocation || 'N/A'}`, 14, 49);
-      doc.text(`Duration: ${projectDetails?.projectDuration || 'N/A'}`, 14, 56);
-      
-      // Client details
       doc.setFont('helvetica', 'bold');
-      doc.text('Client Details:', pageWidth - 90, 35);
+      doc.text('Project Details:', 14, 38);
       doc.setFont('helvetica', 'normal');
-      doc.text(`Name: ${clientDetails?.clientName || 'N/A'}`, pageWidth - 90, 42);
-      doc.text(`Contact: ${clientDetails?.clientContact || 'N/A'}`, pageWidth - 90, 49);
-      doc.text(`Email: ${clientDetails?.clientEmail || 'N/A'}`, pageWidth - 90, 56);
-      
-      // Date
-      doc.text(`Date: ${new Date(report.createdAt).toLocaleDateString()}`, pageWidth - 90, 63);
-      
+      doc.setFontSize(10);
+      doc.text(`Name: ${meta.projectName}`, 14, 45);
+      doc.text(`Manager: ${meta.projectManager}`, 14, 52);
+      doc.text(`Start: ${meta.startDate}`, 14, 59);
+      doc.text(`End: ${meta.endDate}`, 14, 66);
+      doc.text(`Duration: ${meta.duration}`, 14, 73);
+
+      // Client details (right column)
+      doc.setFontSize(12);
+      doc.setFont('helvetica', 'bold');
+      doc.text('Client Details:', rightX, 38);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(10);
+      doc.text(`Name: ${meta.clientName}`, rightX, 45);
+      doc.text(`Company: ${meta.companyName}`, rightX, 52);
+      doc.text(`Phone: ${meta.phone}`, rightX, 59);
+      doc.text(`Email: ${meta.email}`, rightX, 66);
+      doc.text(doc.splitTextToSize(`Address: ${meta.address}`, 85), rightX, 73);
+
       // Table header
       const tableHeaders = [['Description', 'Quantity', 'Unit', 'Rate', 'Amount']];
-      
-      // Table data
-      const tableData = items.map(item => [
-        item.description,
-        item.quantity.toString(),
-        item.unit,
-        item.rate.toString(),
-        (item.quantity * item.rate).toFixed(2)
+
+      // Table data (normalized from the estimator's stored shape)
+      const rows = getReportRows(report);
+      const tableData = rows.map(r => [
+        r.description,
+        r.quantity.toFixed(2),
+        r.unit,
+        r.rate.toFixed(2),
+        r.amount.toFixed(2)
       ]);
-      
-      // Create table
-      doc.autoTable({
-        startY: 70,
+
+      // Create table (below the two detail columns)
+      autoTable(doc, {
+        startY: 88,
         head: tableHeaders,
         body: tableData,
         theme: 'grid',
@@ -328,9 +503,12 @@ const ReportPage = () => {
         }
       });
       
-      // Calculate total
-      const total = items ? items.reduce((sum, item) => sum + (item.quantity * item.rate), 0) : 0;
-      
+      // Calculate total (prefer the value saved by the estimator)
+      const computedTotal = rows.reduce((sum, r) => sum + r.amount, 0);
+      const total = (typeof report.grandTotalCost === 'number' && !Number.isNaN(report.grandTotalCost))
+        ? report.grandTotalCost
+        : computedTotal;
+
       // Add total
       const finalY = doc.lastAutoTable.finalY;
       doc.setFont('helvetica', 'bold');
@@ -345,7 +523,8 @@ const ReportPage = () => {
       doc.text(`(${grandTotalInWords})`, pageWidth / 2, yPosition, { align: 'center' });
       
       // Save the PDF
-      doc.save(`${projectDetails?.projectName || 'Cost_Estimation'}.pdf`);
+      const fileBase = meta.projectName !== 'N/A' ? meta.projectName : 'Cost_Estimation';
+      doc.save(`${fileBase}.pdf`);
       closeAllDropdowns();
     } catch (e) {
       console.error('Error generating PDF:', e);
@@ -443,14 +622,14 @@ const ReportPage = () => {
                         <tr key={(report.id ?? report._id) || Math.random()} className="hover:bg-gray-50">
                           <td className="px-6 py-4 whitespace-nowrap">
                             <div className="font-medium text-gray-900">{report.projectDetails?.projectName || report.projectName || report.title || 'Untitled Project'}</div>
-                            <div className="text-sm text-gray-500">{report.projectDetails?.projectLocation || ''}</div>
+                            <div className="text-sm text-gray-500">{report.projectDetails?.projectManager || ''}</div>
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap">
                             <div className="text-sm text-gray-900">{report.clientDetails?.clientName || 'No client'}</div>
-                            <div className="text-sm text-gray-500">{report.clientDetails?.clientContact || 'No contact'}</div>
+                            <div className="text-sm text-gray-500">{report.clientDetails?.phone || report.clientDetails?.clientContact || 'No contact'}</div>
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                            {report.projectDetails?.projectDuration || 'Not specified'}
+                            {getReportMeta(report).duration}
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                             {report.createdAt ? new Date(report.createdAt).toLocaleDateString() : ''}
@@ -497,6 +676,12 @@ const ReportPage = () => {
                                   className="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
                                 >
                                   📊 Download Excel
+                                </button>
+                                <button
+                                  onClick={() => downloadCSV(report)}
+                                  className="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
+                                >
+                                  🧾 Download CSV
                                 </button>
                                 <button
                                   onClick={() => handleDelete(report)}

@@ -125,67 +125,42 @@ const EstimatorPage = () => {
     }, []);
 
     useEffect(() => {
-        // Handle incoming data from previous steps or existing reports
-        if (location.state) {
-            if (location.state.report) {
-                // Loading existing report for editing
-                const incomingReport = location.state.report;
-                // Prefer server-stored items, fallback to local shape
-                setSearchResults(incomingReport.items || incomingReport.searchResults || []);
-                setInputData(incomingReport.inputData || {});
-                setEditableRates(incomingReport.editableRates || {});
-                setCurrentReportId(incomingReport.id || null);
-                setCurrentServerReportId(incomingReport._id || null);
-                setProjectDetails(incomingReport.projectDetails || {});
-                setClientDetails(incomingReport.clientDetails || {});
-                if (typeof incomingReport.grandTotalCost === 'number') setGrandTotalCost(incomingReport.grandTotalCost);
-                if (incomingReport.grandTotalInWords) setGrandTotalInWords(incomingReport.grandTotalInWords);
-                setMessage({ text: 'Loaded report for editing.', type: 'success' });
-                toast('Loaded report for editing.');
-                // Ensure edit toggles are off by default when loading from DB
-                setIsEditingProjectDetails(false);
-                setIsEditingClientDetails(false);
-                setIsEditingServerReport(true);
-            } else {
-                const navProj = (location.state && location.state.projectDetails) || {};
-                const navClient = (location.state && location.state.clientDetails) || {};
-                setProjectDetails(navProj);
-                setClientDetails(navClient);
-                setIsEditingServerReport(false);
-                // If user arrived from Project/Client flow, create a server draft immediately
-                if (navProj.projectName || navClient.clientName) {
-                    (async () => {
-                        try {
-                            const { createReport } = await import('../services/reportService');
-                            const estimatedTimeNumber = parseInt(navProj?.projectDuration, 10);
-                            const payload = {
-                                title: navProj?.projectName || 'Untitled Project',
-                                description: `Client: ${navClient?.clientName || 'N/A'}; Items: 0`,
-                                projectName: navProj?.projectName || 'Untitled Project',
-                                estimatedCost: 0,
-                                estimatedTime: Number.isNaN(estimatedTimeNumber) ? 0 : estimatedTimeNumber,
-                                status: 'draft',
-                                projectDetails: navProj,
-                                clientDetails: navClient,
-                                items: [],
-                                searchResults: [],
-                                inputData: {},
-                                editableRates: {},
-                                rateSelection: {},
-                                grandTotalCost: 0,
-                                grandTotalInWords: ''
-                            };
-                            const created = await createReport(payload);
-                            if (created && created._id) {
-                                setCurrentServerReportId(created._id);
-                            }
-                        } catch (_) {
-                            // ignore server errors; user can still work and save later
-                        }
-                    })();
-                }
-            }
+        // Handle incoming data from previous steps or existing reports.
+        // IMPORTANT: only act on navigation state that actually carries data.
+        // The toast() helper re-navigates with state={toast}; if we reacted to
+        // that here we would wipe the loaded project/client details back to {}.
+        if (!location.state) return;
+
+        if (location.state.report) {
+            // Loading existing report for editing
+            const incomingReport = location.state.report;
+            // Prefer server-stored items, fallback to local shape
+            setSearchResults(incomingReport.items || incomingReport.searchResults || []);
+            setInputData(incomingReport.inputData || {});
+            setEditableRates(incomingReport.editableRates || {});
+            setCurrentReportId(incomingReport.id || null);
+            setCurrentServerReportId(incomingReport._id || null);
+            setProjectDetails(incomingReport.projectDetails || {});
+            setClientDetails(incomingReport.clientDetails || {});
+            if (typeof incomingReport.grandTotalCost === 'number') setGrandTotalCost(incomingReport.grandTotalCost);
+            if (incomingReport.grandTotalInWords) setGrandTotalInWords(incomingReport.grandTotalInWords);
+            setMessage({ text: 'Loaded report for editing.', type: 'success' });
+            // Ensure edit toggles are off by default when loading from DB
+            setIsEditingProjectDetails(false);
+            setIsEditingClientDetails(false);
+            setIsEditingServerReport(true);
+        } else if (location.state.projectDetails || location.state.clientDetails) {
+            // Arriving fresh from the Project/Client detail forms
+            setProjectDetails(location.state.projectDetails || {});
+            setClientDetails(location.state.clientDetails || {});
+            setIsEditingServerReport(false);
+            // Do NOT create a backend draft here. Creating a report on page entry
+            // produced phantom ₹0 records and duplicates (a racy create that ran again
+            // on Save). The backend report is now created only when the user saves.
+            setCurrentServerReportId(null);
         }
+        // Any other state (e.g. a toast-only { toast } payload) is ignored so it
+        // does not clobber the project/client details already in component state.
     }, [location.state]);
 
     // Keyboard shortcuts for undo/redo
@@ -416,8 +391,9 @@ const EstimatorPage = () => {
             return;
         }
 
+        const localReportId = currentReportId || Date.now().toString();
         const reportData = {
-            id: currentReportId || Date.now().toString(),
+            id: localReportId,
             projectDetails,
             clientDetails,
             searchResults,
@@ -471,11 +447,14 @@ const EstimatorPage = () => {
             }
 
             const existingReports = JSON.parse(localStorage.getItem('roadwent_reports') || '[]');
-            const updatedReports = currentReportId 
-                ? existingReports.map(r => r.id === currentReportId ? reportData : r)
+            const alreadyStored = existingReports.some(r => r.id === localReportId);
+            const updatedReports = alreadyStored
+                ? existingReports.map(r => r.id === localReportId ? reportData : r)
                 : [...existingReports, reportData];
-            
+
             localStorage.setItem('roadwent_reports', JSON.stringify(updatedReports));
+            // Remember the id so subsequent saves update this record instead of appending
+            setCurrentReportId(localReportId);
             setMessage({ text: 'Report saved successfully!', type: 'success' });
             toast('Report saved successfully!');
             
@@ -810,11 +789,13 @@ const EstimatorPage = () => {
             yPosition += 10;
             doc.text(`Client Name: ${clientDetails.clientName || 'Not Specified'}`, 20, yPosition);
             yPosition += 10;
-            doc.text(`Contact Person: ${clientDetails.contactPerson || 'Not Specified'}`, 20, yPosition);
+            doc.text(`Company: ${clientDetails.companyName || 'Not Specified'}`, 20, yPosition);
             yPosition += 10;
             doc.text(`Phone: ${clientDetails.phone || 'Not Specified'}`, 20, yPosition);
             yPosition += 10;
             doc.text(`Email: ${clientDetails.email || 'Not Specified'}`, 20, yPosition);
+            yPosition += 10;
+            doc.text(`Address: ${clientDetails.address || 'Not Specified'}`, 20, yPosition);
             yPosition += 15;
             
             // Table headers

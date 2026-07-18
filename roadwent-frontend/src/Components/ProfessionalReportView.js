@@ -1,6 +1,6 @@
 import React from 'react';
 import jsPDF from 'jspdf';
-import 'jspdf-autotable';
+import autoTable from 'jspdf-autotable';
 
 const ProfessionalReportView = ({ report }) => {
   if (!report) return null;
@@ -66,19 +66,43 @@ const ProfessionalReportView = ({ report }) => {
     doc.setFontSize(18);
     doc.text('Cost Estimation Report', 105, 15, { align: 'center' });
     
-    // Add report info
-    doc.setFontSize(12);
-    const projName = report.projectDetails?.projectName || report.projectName || report.title || 'Untitled Project';
+    // Add report info (using the canonical field names from the entry forms)
+    const p = report.projectDetails || {};
+    const c = report.clientDetails || {};
+    const projName = p.projectName || report.projectName || report.title || 'Untitled Project';
     const created = report.createdAt ? new Date(report.createdAt) : new Date();
-    const location = report.projectDetails?.projectLocation || report.location || 'Not specified';
-    doc.text(`Project: ${projName}`, 20, 30);
-    doc.text(`Date: ${created.toLocaleDateString()}`, 20, 40);
-    doc.text(`Location: ${location}`, 20, 50);
-    
+    const fmt = (d) => {
+      if (!d) return 'Not specified';
+      const dt = new Date(d);
+      return Number.isNaN(dt.getTime()) ? String(d) : dt.toLocaleDateString();
+    };
+
+    doc.setFontSize(10);
+    // Project column (left)
+    doc.setFont('helvetica', 'bold');
+    doc.text('Project Details', 20, 28);
+    doc.setFont('helvetica', 'normal');
+    doc.text(`Name: ${projName}`, 20, 35);
+    doc.text(`Manager: ${p.projectManager || 'Not specified'}`, 20, 41);
+    doc.text(`Start: ${fmt(p.startDate)}`, 20, 47);
+    doc.text(`End: ${fmt(p.endDate)}`, 20, 53);
+    doc.text(`Date: ${created.toLocaleDateString()}`, 20, 59);
+    // Client column (right)
+    doc.setFont('helvetica', 'bold');
+    doc.text('Client Details', 120, 28);
+    doc.setFont('helvetica', 'normal');
+    doc.text(`Name: ${c.clientName || 'Not specified'}`, 120, 35);
+    doc.text(`Company: ${c.companyName || 'Not specified'}`, 120, 41);
+    doc.text(`Phone: ${c.phone || 'Not specified'}`, 120, 47);
+    doc.text(`Email: ${c.email || 'Not specified'}`, 120, 53);
+    doc.text(doc.splitTextToSize(`Address: ${c.address || 'Not specified'}`, 75), 120, 59);
+
     // Add summary data
     doc.setFontSize(14);
-    doc.text('Cost Summary', 20, 70);
-    
+    doc.setFont('helvetica', 'bold');
+    doc.text('Cost Summary', 20, 72);
+    doc.setFont('helvetica', 'normal');
+
     const tableData = [];
     // Prefer estimator-derived totals when inputData present
     const estimatorCalc = report.inputData ? computeTotalsFromEstimator() : { rows: [], sum: 0 };
@@ -94,11 +118,13 @@ const ProfessionalReportView = ({ report }) => {
         : computedTotal);
     tableData.push(['Items Count', Array.isArray(report.items) ? String(report.items.length) : '0']);
     
-    tableData.push(['Total Estimated Cost', `₹${Number(totalCost || 0).toLocaleString()}`]);
+    // NOTE: jsPDF's standard font can't render the ₹ glyph (it corrupts the whole
+    // string), so use an ASCII "Rs." prefix in the PDF. en-IN gives ASCII grouping.
+    tableData.push(['Total Estimated Cost', `Rs. ${Number(totalCost || 0).toLocaleString('en-IN')}`]);
     
     // Generate table
-    doc.autoTable({
-      startY: 75,
+    autoTable(doc, {
+      startY: 78,
       head: [['Metric', 'Value']],
       body: tableData,
       theme: 'striped',
@@ -127,12 +153,14 @@ const ProfessionalReportView = ({ report }) => {
         String(Number(it.rate || 0).toFixed(2)),
         String(Number(it.amount || 0).toFixed(2))
       ]);
-      doc.autoTable({
+      autoTable(doc, {
         startY: yPos + 5,
         head: [['#', 'Description', 'Qty', 'Unit', 'Rate', 'Amount']],
         body: itemsBody,
+        foot: [['', 'TOTAL', '', '', '', `Rs. ${Number(totalCost || 0).toLocaleString('en-IN')}`]],
         theme: 'grid',
-        headStyles: { fillColor: [66, 133, 244] }
+        headStyles: { fillColor: [66, 133, 244] },
+        footStyles: { fillColor: [230, 230, 230], textColor: 20, fontStyle: 'bold' }
       });
       yPos = doc.lastAutoTable.finalY + 10;
     }
